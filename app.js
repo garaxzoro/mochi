@@ -281,7 +281,13 @@ let pendingV = null;
 function nav(r, initV) { pendingV = initV || null; if (('#' + r) === location.hash) { route = r; V = pendingV || {}; pendingV = null; render(); window.scrollTo(0, 0); } else location.hash = r; }
 window.addEventListener('hashchange', () => { route = location.hash.slice(1); V = pendingV || {}; pendingV = null; closeSheet(); render(); window.scrollTo(0, 0); });
 
-function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('show'), 2800); }
+function toast(msg, opt) {
+  const t = $('#toast'); const undo = opt && opt.undo;
+  t.innerHTML = '<span>' + esc(msg) + '</span>' + (undo ? '<button type="button" class="undo">復原</button>' : '');
+  t.classList.toggle('has-undo', !!undo);
+  if (undo) t.querySelector('.undo').onclick = () => { t.classList.remove('show'); clearTimeout(toast._t); undo(); };
+  t.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove('show'), undo ? 5000 : 2800);
+}
 function backBar(title, to) { return '<div class="back"><a class="icon-btn" href="#' + (to || 'home') + '" aria-label="返回">' + I.back + '</a><h1 class="h1" style="font-size:22px">' + title + '</h1></div>'; }
 
 /* 時間選擇（補記用） */
@@ -373,14 +379,44 @@ function suggestFastStart(sinceStr) {
   if (meals.length) return meals[meals.length - 1].at;
   return toLocal(new Date(parseLocal(sinceStr).getTime() + windowHours() * 3600000));
 }
-async function setFast(state, record) {
-  const s = Object.assign({}, S.settings, { fastState: state });
-  try {
-    if (record) await api('save', { record });
-    await api('setSettings', { settings: s });
-  } catch (e) { return failSave(e); }
-  S.settings = s; if (record) S.records.push(record), sortRecs();
-  cacheNow();
+/* ========== 背景上傳（先顯示，再排隊送到試算表） ========== */
+let outbox = LS.get('outbox', []);
+let flushing = false, needRefresh = false;
+function applyLocal(action, p) {
+  if (action === 'save') { const i = S.records.findIndex(r => r.id === p.record.id); if (i >= 0) S.records[i] = p.record; else S.records.push(p.record); sortRecs(); }
+  else if (action === 'del') S.records = S.records.filter(r => r.id !== p.id);
+  else if (action === 'setSettings') S.settings = p.settings;
+  else if (action === 'saveFav') { const i = S.favs.findIndex(f => f.id === p.fav.id); if (i >= 0) S.favs[i] = p.fav; else S.favs.push(p.fav); }
+  else if (action === 'delFav') S.favs = S.favs.filter(f => f.id !== p.id);
+}
+function send(action, payload) {
+  applyLocal(action, payload); cacheNow();
+  outbox.push({ action, payload }); LS.set('outbox', outbox);
+  flush();
+}
+async function flush() {
+  if (flushing) return; flushing = true;
+  let netFail = false;
+  while (outbox.length) {
+    const it = outbox[0];
+    try { await api(it.action, it.payload); outbox.shift(); LS.set('outbox', outbox); }
+    catch (e) {
+      if (e instanceof OfflineError) { netFail = true; break; }
+      outbox.shift(); LS.set('outbox', outbox); needRefresh = true;
+      toast(e.code === 'auth' ? '通行碼不對，有一筆沒存到，請到設定重新連線' : '有一筆沒存到：' + (e.message || '請稍後再試'));
+    }
+  }
+  flushing = false;
+  if (netFail) toast('網路不太穩，剛剛的紀錄會在下次打開時自動補上');
+  if (needRefresh && !outbox.length) { needRefresh = false; refresh(); }
+}
+function offlineBlock() { if (!isDemo() && !navigator.onLine) { toast('沒有網路，稍後再記喔'); return true; } return false; }
+
+function setFast(state, record) {
+  if (offlineBlock()) return false;
+  if (record) send('save', { record });
+  flushSettingsNow();
+  send('setSettings', { settings: Object.assign({}, S.settings, { fastState: state }) });
   return true;
 }
 
@@ -392,24 +428,27 @@ function failSave(e) {
   else toast(e.message || '儲存失敗，稍後再試');
   return false;
 }
-async function saveRecord(rec, kind) {
+function saveRecord(rec, kind) {
+  if (offlineBlock()) return false;
   const before = xpInfo();
-  try { await api('save', { record: rec }); } catch (e) { return failSave(e); }
-  const i = S.records.findIndex(r => r.id === rec.id);
-  if (i >= 0) S.records[i] = rec; else S.records.push(rec);
-  sortRecs(); cacheNow();
-  if (i < 0) {
+  const isNew = !S.records.some(r => r.id === rec.id);
+  send('save', { record: rec });
+  if (isNew) {
     S.justSaved = Date.now();
     const after = xpInfo();
     const gained = after.xp - before.xp;
     if (after.lv > before.lv) S.celebrate = { lv: after.lv, stageUp: stageOf(after.lv).n > stageOf(before.lv).n };
-    toast(cheer(kind || rec.type) + (gained > 0 ? '　+' + gained + ' EXP' : ''));
+    toast(cheer(kind || rec.type) + (gained > 0 ? '　+' + gained + ' EXP' : ''), { undo: () => undoRecord(rec.id) });
   } else toast('已更新');
   return true;
 }
-async function deleteRecord(id) {
-  try { await api('del', { id }); } catch (e) { return failSave(e); }
-  S.records = S.records.filter(r => r.id !== id); cacheNow(); toast('已刪除'); return true;
+function undoRecord(id) {
+  if (!S.records.some(r => r.id === id)) return;
+  send('del', { id }); S.justSaved = 0; S.celebrate = null; render(); toast('已復原，這筆不算');
+}
+function deleteRecord(id) {
+  if (offlineBlock()) return false;
+  send('del', { id }); toast('已刪除'); return true;
 }
 
 /* ========== 餐點 ========== */
@@ -447,10 +486,10 @@ function vMeal() {
   h += '<div class="stack mt">' + timePicker('at') +
     '<div class="row wrap"><span class="small">餐別</span>' + ['早餐', '午餐', '晚餐', '點心'].map(x => '<button class="chip rose' + (V.meal === x ? ' on' : '') + '" data-act="meal-type" data-v="' + x + '">' + x + '</button>').join('') + '</div>' +
     '<div class="row"><span class="small" style="white-space:nowrap">店家</span><input class="input" style="padding:8px 12px" data-change="meal-store" value="' + esc(V.store || '') + '" placeholder="可不填"></div></div>';
-  h += '<div class="card mt stack"><div class="between" style="align-items:baseline"><input data-change="meal-name" value="' + esc(R.name || '') + '" aria-label="餐點名稱" style="border:0;font-size:15px;font-weight:700;background:transparent;min-width:0;flex:1"><div style="font-family:Huninn;font-size:24px;color:var(--rose-d);white-space:nowrap">約 ' + tot.kcal + ' 大卡</div></div>';
+  h += '<div class="card mt stack"><div class="between" style="align-items:baseline"><input data-change="meal-name" value="' + esc(R.name || '') + '" aria-label="餐點名稱" style="border:0;font-size:16px;font-weight:700;background:transparent;min-width:0;flex:1"><div style="font-family:Huninn;font-size:24px;color:var(--rose-d);white-space:nowrap">約 ' + tot.kcal + ' 大卡</div></div>';
   h += '<div>' + R.items.map((it, i) => {
     const m = it.mult == null ? 1 : it.mult;
-    return '<div class="item"><div class="between"><input data-change="item-name" data-i="' + i + '" value="' + esc(it.name) + '" aria-label="品項名稱" style="border:0;background:transparent;font-size:14px;min-width:0;flex:1"><span class="row" style="gap:4px"><input type="number" inputmode="numeric" data-change="item-kcal" data-i="' + i + '" value="' + Math.round(it.kcal * m) + '" aria-label="' + esc(it.name) + ' 熱量" style="width:64px;text-align:right;border:1px solid var(--line);border-radius:8px;padding:4px 6px;font-size:14px"><span class="small">大卡</span><button class="icon-btn" style="width:36px;height:36px" aria-label="移除 ' + esc(it.name) + '" data-act="item-del" data-i="' + i + '">' + I.x + '</button></span></div>' +
+    return '<div class="item"><div class="between"><input data-change="item-name" data-i="' + i + '" value="' + esc(it.name) + '" aria-label="品項名稱" style="border:0;background:transparent;font-size:16px;min-width:0;flex:1"><span class="row" style="gap:4px"><input type="number" inputmode="numeric" data-change="item-kcal" data-i="' + i + '" value="' + Math.round(it.kcal * m) + '" aria-label="' + esc(it.name) + ' 熱量" style="width:64px;text-align:right;border:1px solid var(--line);border-radius:8px;padding:4px 6px;font-size:16px"><span class="small">大卡</span><button class="icon-btn" style="width:36px;height:36px" aria-label="移除 ' + esc(it.name) + '" data-act="item-del" data-i="' + i + '">' + I.x + '</button></span></div>' +
       '<div class="row wrap"><span class="small">' + esc(it.portion || '') + '</span><div class="portion">' + [[0.25, '1/4'], [0.5, '1/2'], [0.75, '3/4'], [1, '1'], [1.5, '1.5'], [2, '2']].map(p => '<button class="' + (m === p[0] ? 'on' : '') + '" data-act="item-mult" data-i="' + i + '" data-v="' + p[0] + '">' + p[1] + '</button>').join('') + '</div></div></div>';
   }).join('') + '</div><button class="btn btn-ghost" data-act="item-add">＋ 自己加一項</button>';
   h += '<div class="nut">' + [['蛋白質', tot.protein, 'g'], ['碳水', tot.carbs, 'g'], ['脂肪', tot.fat, 'g'], ['纖維', tot.fiber, 'g'], ['鈉', tot.sodium, 'mg'], ['糖', tot.sugar, 'g']].map(n => '<div>' + n[0] + '<b>' + n[1] + ' ' + n[2] + '</b></div>').join('') + '</div></div>';
@@ -513,7 +552,7 @@ function vExercise() {
   h += '<div class="sec">做了什麼？</div><div class="grid2">' + ['walk', 'aerobic', 'yoga'].map(x => '<button class="btn ' + (V.kind === x ? 'btn-green' : 'btn-gsoft') + '" style="min-height:60px;font-size:16px" data-act="ex-kind" data-v="' + x + '">' + EX[x].label + '</button>').join('') +
     '<button class="btn ' + (['walk', 'aerobic', 'yoga'].indexOf(V.kind) < 0 ? 'btn-green' : 'btn-dashed') + '" style="min-height:60px;font-size:16px" data-act="ex-other">' + (['walk', 'aerobic', 'yoga'].indexOf(V.kind) < 0 ? esc(label) : '其他 ＋') + '</button></div>';
   h += '<div class="sec">做了多久？</div><div class="grid5">' + [10, 20, 30, 45].map(x => '<button class="chip' + (V.min === x && !V.minCustom ? ' on' : '') + '" data-act="ex-min" data-v="' + x + '">' + x + ' 分</button>').join('') +
-    '<label class="chip' + (V.minCustom ? ' on' : '') + '" style="padding:0 4px"><input type="number" inputmode="numeric" data-change="ex-min-custom" placeholder="自填" value="' + (V.minCustom ? V.min : '') + '" aria-label="自填分鐘數" style="width:100%;border:0;background:transparent;text-align:center;font-size:14px;color:inherit"></label></div>';
+    '<label class="chip' + (V.minCustom ? ' on' : '') + '" style="padding:0 4px"><input type="number" inputmode="numeric" data-change="ex-min-custom" placeholder="自填" value="' + (V.minCustom ? V.min : '') + '" aria-label="自填分鐘數" style="width:100%;border:0;background:transparent;text-align:center;font-size:16px;color:inherit"></label></div>';
   h += '<div class="sec">累不累？</div><div class="stack" style="gap:8px">' + LEVELS.map((l, i) => '<button class="opt' + (V.level === i + 1 ? ' on' : '') + '" data-act="ex-level" data-v="' + (i + 1) + '"><b>' + l.b + '</b><span>' + l.s + '</span></button>').join('') + '</div>';
   h += '<div class="between mt2"><div class="sub">' + esc(label) + ' ' + V.min + ' 分，' + LEVELS[V.level - 1].b + '<div style="font-size:18px;font-weight:700;color:var(--ink)">約消耗 ' + kcal + ' 大卡</div></div><button class="btn btn-green btn-big" data-act="ex-save">存檔 +15 EXP</button></div>';
   const list = recsOn(todayKey(), 'exercise').slice().reverse();
@@ -543,7 +582,7 @@ function vReport() {
     meter('熱量', avgK + ' / ' + t.kcal + ' 大卡', avgK / t.kcal, '#C2554D', '#F4DEDA') + meter('蛋白質', avgP + ' / ' + t.protein + ' g', avgP / t.protein, '#D9A441', '#F1E8DE') + '</div>';
   h += '<div class="say mt"><img src="' + petImg('happy') + '" alt="麻糬"><div class="bubble" style="font-size:13px">' + esc(weekTalk(stats, t)) + '</div></div>';
   // 單日紀錄
-  h += '<div class="sec between"><span>查看某一天</span><input type="date" data-change="rep-day" value="' + V.day + '" max="' + todayKey() + '" aria-label="選擇日期" style="border:1px solid var(--line);border-radius:10px;padding:6px 8px;background:#fff;font-size:15px"></div>';
+  h += '<div class="sec between"><span>查看某一天</span><input type="date" data-change="rep-day" value="' + V.day + '" max="' + todayKey() + '" aria-label="選擇日期" style="border:1px solid var(--line);border-radius:10px;padding:6px 8px;background:#fff;font-size:16px"></div>';
   const recs = recsOn(V.day).slice().reverse();
   h += recs.length ? '<div class="list">' + recs.map(r => '<button class="li" data-act="' + (r.type === 'meal' ? 'edit-meal' : 'rec-edit') + '" data-id="' + r.id + '"><span>' + hm(r.at) + '　' + recDesc(r) + '</span><span class="r">修改</span></button>').join('') + '</div>' : '<div class="list"><div class="empty">這天沒有紀錄</div></div>';
   return h;
@@ -632,11 +671,14 @@ function vSettings() {
   return h;
 }
 function fieldNum(k, label, v, ph) { return '<label class="field"><span>' + label + '</span><input type="number" inputmode="decimal" data-change="set-num" data-k="' + k + '" value="' + (v == null ? '' : esc(v)) + '" placeholder="' + esc(ph) + '"></label>'; }
-async function saveSettings(patch) {
+let setTimer = null;
+function flushSettingsNow() { if (setTimer) { clearTimeout(setTimer); setTimer = null; send('setSettings', { settings: S.settings }); } }
+function saveSettings(patch, noRender) {
   const s = JSON.parse(JSON.stringify(S.settings));
   Object.keys(patch).forEach(k => { if (k.indexOf('o.') === 0) { s.override = s.override || {}; const kk = k.slice(2); if (patch[k] === '' || patch[k] == null) delete s.override[kk]; else s.override[kk] = patch[k]; } else if (patch[k] === '' || patch[k] == null) delete s[k]; else s[k] = patch[k]; });
-  try { await api('setSettings', { settings: s }); } catch (e) { failSave(e); render(); return; }
-  S.settings = s; cacheNow(); render();
+  S.settings = s; cacheNow();
+  clearTimeout(setTimer); setTimer = setTimeout(() => { setTimer = null; send('setSettings', { settings: S.settings }); }, 1200);
+  if (!noRender) render();
 }
 
 /* ========== 底部面板 ========== */
@@ -761,14 +803,14 @@ A['meal-save'] = async () => {
   if (!ok) return;
   if (V.addFav && !V.editId) {
     const fav = { id: uid(), name: data.name, store: data.store, items: data.items.map(i => Object.assign({}, i)) };
-    try { await api('saveFav', { fav }); S.favs.push(fav); cacheNow(); } catch (e) { /* 常用清單失敗不影響紀錄 */ }
+    send('saveFav', { fav });
   }
   go('home');
 };
 A['meal-delete'] = async () => { if (!confirm('確定刪除這一餐？')) return; if (await deleteRecord(V.editId)) go('home'); };
 A['edit-meal'] = el => nav('meal', { editId: el.dataset.id });
 A['fav-use'] = el => { const f = S.favs.find(x => x.id === el.dataset.id); if (!f) return; V.result = { name: f.name, items: JSON.parse(JSON.stringify(f.items)), comment: '' }; V.store = f.store || ''; V.addFav = false; V.at = nowLocal(); V.meal = mealTypeFor(V.at); render(); };
-A['fav-del'] = async el => { if (!confirm('從常用清單移除？')) return; try { await api('delFav', { id: el.dataset.id }); } catch (e) { return failSave(e); } S.favs = S.favs.filter(f => f.id !== el.dataset.id); cacheNow(); render(); };
+A['fav-del'] = el => { if (!confirm('從常用清單移除？')) return; if (offlineBlock()) return; send('delFav', { id: el.dataset.id }); render(); };
 
 A['fast-start'] = () => openFastTime('fast');
 A['fast-done'] = () => openFastTime('fast');
@@ -799,10 +841,19 @@ A['fast-sheet-ok'] = async () => {
 A['rep-range'] = el => { V.range = Number(el.dataset.v); render(); };
 A['set'] = el => { const k = el.dataset.k; let v = el.dataset.v; if (k === 'speed') v = Number(v); if (k === 'fastOff') v = v === '1'; saveSettings({ [k]: v }); };
 
+const GUARD = { 'water-quick': 1, 'water-add': 1, 'water-custom': 1, 'weight-save': 1, 'rec-save': 1, 'rec-del': 1, 'ex-save': 1, 'meal-save': 1, 'meal-delete': 1, 'meal-analyze': 1, 'fast-sheet-ok': 1, 'fast-confirm': 1, 'setup-go': 1, 'fav-del': 1 };
+let lastTap = { k: '', t: 0 };
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]'); if (!el) return;
-  const f = A[el.dataset.act]; if (!f) return;
+  const act = el.dataset.act; const f = A[act]; if (!f) return;
   if (el.tagName === 'A') e.preventDefault();
+  if (GUARD[act]) {
+    const k = act + '|' + (el.dataset.id || '') + '|' + (el.dataset.ml || '');
+    const now = Date.now();
+    if (k === lastTap.k && now - lastTap.t < 1500) return;
+    lastTap = { k, t: now };
+    el.classList.add('tapped'); setTimeout(() => el.classList.remove('tapped'), 300);
+  }
   f(el, e);
 });
 
@@ -824,7 +875,7 @@ C['item-kcal'] = el => {
 };
 C['ex-min-custom'] = el => { const v = Math.round(Number(el.value)); if (v > 0) { V.min = v; V.minCustom = true; render(); } };
 C['rep-day'] = el => { if (el.value) { V.day = el.value; render(); } };
-C['set-num'] = el => { const v = el.value === '' ? '' : Number(el.value); saveSettings({ [el.dataset.k]: v }); };
+C['set-num'] = el => { const v = el.value === '' ? '' : Number(el.value); saveSettings({ [el.dataset.k]: v }, true); };
 C['set-sel'] = el => { saveSettings({ [el.dataset.k]: Number(el.value) }); };
 document.addEventListener('change', e => { const el = e.target.closest('[data-change]'); if (!el) return; const f = C[el.dataset.change]; if (f) f(el, e); });
 // 文字輸入即時記住（避免重畫時遺失）
@@ -832,19 +883,32 @@ document.addEventListener('input', e => { const el = e.target; if (el.dataset &&
 
 /* 每分鐘更新首頁時間 */
 setInterval(() => { if ((route || 'home') === 'home' && S.loaded && !$('#sheet-root').innerHTML && document.activeElement === document.body) render(); }, 60000);
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.loaded && !isDemo()) refresh(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { flushSettingsNow(); return; }
+  if (S.loaded) { flush(); if (!isDemo()) refresh(); }
+});
+window.addEventListener('online', () => flush());
+window.addEventListener('hashchange', flushSettingsNow);
 
 /* ========== 啟動 ========== */
 async function refresh() {
-  try { const d = await api('load'); applyData(d); if (!$('#sheet-root').innerHTML) render(); }
+  if (outbox.length || flushing || setTimer) { needRefresh = true; return; }
+  try {
+    const d = await api('load');
+    if (outbox.length || setTimer) { needRefresh = true; return; }
+    applyData(d);
+    const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+    if (!$('#sheet-root').innerHTML && !typing) render();
+  }
   catch (e) { if (e.code === 'auth') { LS.del('pass'); S.loaded = false; render(); toast('通行碼不對，請重新輸入'); } else if (!S.loaded) { toast(e instanceof OfflineError ? '目前沒有網路，先顯示上次的資料' : e.message); } }
 }
 function boot() {
   route = location.hash.slice(1);
   if (apiUrl() && (isDemo() || passcode())) {
     const c = LS.get('cache', null);
-    if (c) applyData(c);
-    render(); refresh();
+    if (c) { applyData(c); outbox.forEach(it => applyLocal(it.action, it.payload)); }
+    render();
+    if (outbox.length) { needRefresh = true; flush(); } else refresh();
   } else render();
 }
 window.__mochi = { S, xpInfo, calcTargets, dayStats, mealTotals, exKcal, stageOf };
